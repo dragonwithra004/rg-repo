@@ -28,6 +28,48 @@ export const REQUIRED_TABLES_20 = [
   'employee_requests',
 ] as const;
 
+export interface DbTlsDiagnostics {
+  tls_enabled: boolean;
+  tls_protocol: string | null;
+  certificate_valid: boolean;
+  certificate_status:
+    | 'verified'
+    | 'self_signed_chain'
+    | 'untrusted_ca'
+    | 'expired'
+    | 'not_checked'
+    | 'error';
+  hostname_valid: boolean;
+  hostname_status: 'verified' | 'mismatch' | 'not_checked' | 'error';
+  connection_status:
+    | 'connected'
+    | 'tls_error'
+    | 'auth_error'
+    | 'network_error'
+    | 'not_configured';
+  ca_source: string;
+  ca_bundle_count: number;
+  bundled_supabase_ca_loaded: boolean;
+  custom_ca_configured: boolean;
+  custom_ca_subject: string | null;
+  custom_ca_fingerprint256: string | null;
+  peer_subject_cn: string | null;
+  peer_issuer_cn: string | null;
+  diagnostic_summary: string;
+  missing_cert_guidance: string | null;
+  checked_at: string | null;
+}
+
+export interface ParsedPostgresUri {
+  host: string;
+  port: number;
+  user: string;
+  database: string;
+  password?: string;
+  isPooler: boolean;
+  strippedSslParams: string[];
+}
+
 export interface InfraMetadata {
   supabase_host: string;
   supabase_port: number;
@@ -50,6 +92,7 @@ export interface InfraMetadata {
   last_db_test_ok: boolean | null;
   last_db_test_message: string | null;
   last_db_test_at: string | null;
+  last_db_tls_diagnostics: DbTlsDiagnostics | null;
   last_backend_test_ok: boolean | null;
   last_backend_test_message: string | null;
   last_backend_test_at: string | null;
@@ -169,8 +212,188 @@ const PREV_MASTER_KEY_FILENAME = '.rgstudio-master.key.prev';
 const KEY_MIGRATION_STAGE_FILENAME = '.rgstudio-key-migration.stage.json';
 const PRE_MIGRATION_BACKUP_FILENAME = '.rgstudio-pre-migration-backup.rgcfg';
 const HOSTING_SECRETS_ENV_FILENAME = '.rgstudio-hosting-secrets.env';
+const CUSTOM_DB_CA_FILENAME = '.rgstudio-db-ca.crt';
 const CONFIG_AAD = Buffer.from('rgstudio-server-config-v2');
 const BACKUP_AAD = Buffer.from('rgstudio-encrypted-backup-v1');
+const INSECURE_SSL_MODES = new Set(['disable', 'allow', 'prefer', 'no-verify', 'false', '0']);
+const CONFLICTING_SSL_PARAMS = new Set([
+  'sslmode',
+  'ssl',
+  'sslrootcert',
+  'sslcert',
+  'sslkey',
+  'sslcrl',
+]);
+
+export function parsePostgresConnectionUri(rawUri: string): ParsedPostgresUri {
+  const normalized = rawUri
+    .trim()
+    .replace(/^postgresql\+(asyncpg|psycopg):\/\//i, 'postgresql://')
+    .replace(/^postgres:\/\//i, 'postgresql://');
+
+  const parsed = new URL(normalized);
+  if (!parsed.hostname) {
+    throw new Error('Connection URI must include a valid PostgreSQL hostname.');
+  }
+
+  const strippedSslParams: string[] = [];
+  for (const [paramKey, paramVal] of parsed.searchParams.entries()) {
+    const kLower = paramKey.toLowerCase();
+    if (CONFLICTING_SSL_PARAMS.has(kLower)) {
+      if (
+        (kLower === 'sslmode' || kLower === 'ssl') &&
+        INSECURE_SSL_MODES.has(paramVal.trim().toLowerCase())
+      ) {
+        throw new Error(
+          `Insecure PostgreSQL parameter '${paramKey}=${paramVal}' is not allowed. Verified TLS (verify-full) is enforced.`
+        );
+      }
+      strippedSslParams.push(`${paramKey}=${paramVal}`);
+    }
+  }
+
+  const isPooler =
+    parsed.hostname.toLowerCase().includes('.pooler.supabase.com') || parsed.port === '6543';
+  const defaultPort = isPooler ? 6543 : 5432;
+  const port = parsed.port ? Number(parsed.port) : defaultPort;
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error('Connection URI includes an invalid PostgreSQL port.');
+  }
+
+  return {
+    host: parsed.hostname,
+    port,
+    user: decodeURIComponent(parsed.username || 'postgres'),
+    database: decodeURIComponent(parsed.pathname.replace(/^\//, '') || 'postgres'),
+    password: parsed.password ? decodeURIComponent(parsed.password) : undefined,
+    isPooler,
+    strippedSslParams,
+  };
+}
+
+function splitPemCertificates(pemBundle: string): string[] {
+  const matches = pemBundle.match(
+    /-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g
+  );
+  return matches ? matches.map((block) => `${block.trim()}\n`) : [];
+}
+
+function findBundledSupabaseCaPath(): string | null {
+  const candidates = [
+    path.resolve(process.cwd(), 'backend/certs/supabase-prod-ca-2021.crt'),
+    path.resolve(process.cwd(), 'certs/supabase-prod-ca-2021.crt'),
+  ];
+  for (const p of candidates) {
+    if (fs.existsSync(p)) return p;
+  }
+  return null;
+}
+
+interface ResolvedPostgresCaTrust {
+  caList: string[];
+  caSources: string[];
+  bundledSupabaseCaLoaded: boolean;
+  customCaConfigured: boolean;
+  customCaSubject: string | null;
+  customCaFingerprint256: string | null;
+  configError: string | null;
+}
+
+function resolvePostgresCaTrust(storageDir: string): ResolvedPostgresCaTrust {
+  const caList: string[] = [...tls.rootCertificates];
+  const caSources: string[] = ['Node/Mozilla Root CAs'];
+  let bundledSupabaseCaLoaded = false;
+  let customCaConfigured = false;
+  let customCaSubject: string | null = null;
+  let customCaFingerprint256: string | null = null;
+  let configError: string | null = null;
+
+  const supabaseCaPath = findBundledSupabaseCaPath();
+  if (supabaseCaPath) {
+    try {
+      const raw = fs.readFileSync(supabaseCaPath, 'utf-8');
+      const blocks = splitPemCertificates(raw);
+      for (const blk of blocks) {
+        new crypto.X509Certificate(blk);
+        caList.push(blk);
+      }
+      if (blocks.length > 0) {
+        bundledSupabaseCaLoaded = true;
+        caSources.push('Supabase Root 2021 CA (prod-ca-2021.crt)');
+      }
+    } catch (err) {
+      configError = `Bundled Supabase CA certificate is unreadable or invalid: ${
+        err instanceof Error ? err.message : 'parse error'
+      }`;
+    }
+  }
+
+  const customFileCandidates = [
+    String(process.env.RG_DB_SSL_CA_FILE || '').trim(),
+    path.join(storageDir, CUSTOM_DB_CA_FILENAME),
+    path.resolve(process.cwd(), CUSTOM_DB_CA_FILENAME),
+  ].filter(Boolean);
+
+  for (const fileCandidate of customFileCandidates) {
+    if (!fs.existsSync(fileCandidate)) continue;
+    try {
+      const raw = fs.readFileSync(fileCandidate, 'utf-8');
+      const blocks = splitPemCertificates(raw);
+      if (blocks.length === 0) {
+        configError = `Server CA file (${path.basename(fileCandidate)}) does not contain a valid PEM certificate.`;
+        break;
+      }
+      for (const blk of blocks) {
+        const x = new crypto.X509Certificate(blk);
+        caList.push(blk);
+        customCaSubject = x.subject.replace(/\n/g, ', ');
+        customCaFingerprint256 = x.fingerprint256;
+      }
+      customCaConfigured = true;
+      caSources.push(`Protected Server CA File (${path.basename(fileCandidate)})`);
+      break;
+    } catch (err) {
+      configError = `Server CA file (${path.basename(fileCandidate)}) failed X.509 validation: ${
+        err instanceof Error ? err.message : 'invalid certificate'
+      }`;
+      break;
+    }
+  }
+
+  const envInlineCa = String(process.env.RG_DB_SSL_CA_CERT || '').trim();
+  if (envInlineCa) {
+    try {
+      const normalizedPem = envInlineCa.replace(/\\n/g, '\n');
+      const blocks = splitPemCertificates(normalizedPem);
+      if (blocks.length === 0) {
+        configError = 'Hosting secret RG_DB_SSL_CA_CERT does not contain a valid PEM certificate.';
+      } else {
+        for (const blk of blocks) {
+          const x = new crypto.X509Certificate(blk);
+          caList.push(blk);
+          customCaSubject = x.subject.replace(/\n/g, ', ');
+          customCaFingerprint256 = x.fingerprint256;
+        }
+        customCaConfigured = true;
+        caSources.push('Hosting Secret CA (RG_DB_SSL_CA_CERT)');
+      }
+    } catch (err) {
+      configError = `Hosting secret RG_DB_SSL_CA_CERT failed X.509 validation: ${
+        err instanceof Error ? err.message : 'invalid certificate'
+      }`;
+    }
+  }
+
+  return {
+    caList,
+    caSources,
+    bundledSupabaseCaLoaded,
+    customCaConfigured,
+    customCaSubject,
+    customCaFingerprint256,
+    configError,
+  };
+}
 
 function resolveStorageDirectory(): {
   dir: string;
@@ -424,6 +647,7 @@ function defaultMetadata(): InfraMetadata {
     last_db_test_ok: null,
     last_db_test_message: null,
     last_db_test_at: null,
+    last_db_tls_diagnostics: null,
     last_backend_test_ok: null,
     last_backend_test_message: null,
     last_backend_test_at: null,
@@ -490,6 +714,7 @@ export class PermanentConfigStore {
       masterKeyPath: path.join(dirInfo.dir, MASTER_KEY_FILENAME),
       prevMasterKeyPath: path.join(dirInfo.dir, PREV_MASTER_KEY_FILENAME),
       hostingSecretsPath: path.join(dirInfo.dir, HOSTING_SECRETS_ENV_FILENAME),
+      customDbCaPath: path.join(dirInfo.dir, CUSTOM_DB_CA_FILENAME),
     };
   }
 
@@ -590,21 +815,22 @@ export class PermanentConfigStore {
     const envDbUrl = String(process.env.RG_DATABASE_URL || '').trim();
     if (!meta.explicit_db_reset && envDbUrl && (!meta.supabase_host || !secrets.supabase_password)) {
       try {
-        const normalized = envDbUrl.replace(/^postgresql\+(asyncpg|psycopg):\/\//, 'postgresql://');
-        const parsed = new URL(normalized);
-        if (parsed.hostname && !meta.supabase_host) {
-          meta.supabase_host = parsed.hostname;
-          meta.supabase_port = parsed.port ? Number(parsed.port) : 6543;
-          meta.supabase_user = decodeURIComponent(parsed.username || 'postgres');
-          meta.supabase_db_name = parsed.pathname.replace(/^\//, '') || 'postgres';
+        const parsed = parsePostgresConnectionUri(envDbUrl);
+        if (parsed.host && !meta.supabase_host) {
+          meta.supabase_host = parsed.host;
+          meta.supabase_port = parsed.port;
+          meta.supabase_user = parsed.user;
+          meta.supabase_db_name = parsed.database;
+          meta.db_pooler_mode = parsed.isPooler;
+          meta.db_ssl_require = true;
           changed = true;
         }
         if (parsed.password && !secrets.supabase_password) {
-          secrets.supabase_password = decodeURIComponent(parsed.password);
+          secrets.supabase_password = parsed.password;
           changed = true;
         }
       } catch {
-        // Ignore malformed env URL
+        // Ignore malformed or insecure env URL
       }
     }
     const envJwt = String(process.env.RG_JWT_SECRET_KEY || '').trim();
@@ -680,6 +906,10 @@ export class PermanentConfigStore {
           : current.last_db_test_message,
       last_db_test_at:
         nextMeta.last_db_test_at !== undefined ? nextMeta.last_db_test_at : current.last_db_test_at,
+      last_db_tls_diagnostics:
+        nextMeta.last_db_tls_diagnostics !== undefined
+          ? nextMeta.last_db_tls_diagnostics
+          : current.last_db_tls_diagnostics,
       last_backend_test_ok:
         nextMeta.last_backend_test_ok !== undefined
           ? nextMeta.last_backend_test_ok
@@ -779,6 +1009,7 @@ export class PermanentConfigStore {
         last_db_test_ok: null,
         last_db_test_message: null,
         last_db_test_at: null,
+        last_db_tls_diagnostics: null,
       },
       undefined,
       { markSavedNow: true, clearSupabasePassword: true }
@@ -995,14 +1226,68 @@ export class PermanentConfigStore {
     return msg;
   }
 
-  public async testPostgresConnection(
-    cfg: DecryptedInfraConfig
-  ): Promise<{ ok: boolean; message: string }> {
-    if (!cfg.supabase_host || !cfg.supabase_password) {
-      return {
-        ok: false,
-        message: 'Enter and save your NEW Supabase hostname and database password first.',
-      };
+  public getCurrentTlsTrustDiagnostics(): DbTlsDiagnostics {
+    const { dirInfo } = this.getPaths();
+    const trust = resolvePostgresCaTrust(dirInfo.dir);
+    return {
+      tls_enabled: true,
+      tls_protocol: null,
+      certificate_valid: false,
+      certificate_status: trust.configError ? 'error' : 'not_checked',
+      hostname_valid: false,
+      hostname_status: 'not_checked',
+      connection_status: 'not_configured',
+      ca_source: trust.caSources.join(' + '),
+      ca_bundle_count: trust.caList.length,
+      bundled_supabase_ca_loaded: trust.bundledSupabaseCaLoaded,
+      custom_ca_configured: trust.customCaConfigured,
+      custom_ca_subject: trust.customCaSubject,
+      custom_ca_fingerprint256: trust.customCaFingerprint256,
+      peer_subject_cn: null,
+      peer_issuer_cn: null,
+      diagnostic_summary:
+        trust.configError || 'Strict TLS (verify-full) configured; run connection test to verify live certificate.',
+      missing_cert_guidance: trust.configError,
+      checked_at: null,
+    };
+  }
+
+  public saveCustomDbCaCertificate(pemContent: string): DbTlsDiagnostics {
+    const blocks = splitPemCertificates(pemContent);
+    if (blocks.length === 0) {
+      throw new Error(
+        'Invalid CA certificate: paste or upload a PEM certificate containing -----BEGIN CERTIFICATE-----.'
+      );
+    }
+    for (const blk of blocks) {
+      new crypto.X509Certificate(blk);
+    }
+    const { customDbCaPath } = this.getPaths();
+    writeFileDurable(customDbCaPath, `${blocks.join('\n')}`);
+    return this.getCurrentTlsTrustDiagnostics();
+  }
+
+  public clearCustomDbCaCertificate(): DbTlsDiagnostics {
+    const { customDbCaPath } = this.getPaths();
+    if (fs.existsSync(customDbCaPath)) {
+      fs.unlinkSync(customDbCaPath);
+    }
+    return this.getCurrentTlsTrustDiagnostics();
+  }
+
+  private buildPgClientConfig(cfg: DecryptedInfraConfig): {
+    client: PgClient;
+    trust: ResolvedPostgresCaTrust;
+  } {
+    const { dirInfo } = this.getPaths();
+    const trust = resolvePostgresCaTrust(dirInfo.dir);
+    if (trust.configError) {
+      throw new Error(trust.configError);
+    }
+    if (cfg.db_ssl_require === false) {
+      throw new Error(
+        'Insecure SSL-disabled mode is prohibited. Verified TLS (rejectUnauthorized: true) is required.'
+      );
     }
 
     const client = new PgClient({
@@ -1011,12 +1296,228 @@ export class PermanentConfigStore {
       user: cfg.supabase_user || 'postgres',
       database: cfg.supabase_db_name || 'postgres',
       password: cfg.supabase_password,
-      ssl: cfg.db_ssl_require ? { rejectUnauthorized: true } : false,
-      connectionTimeoutMillis: 6000,
-      statement_timeout: 6000,
+      ssl: {
+        ca: trust.caList,
+        rejectUnauthorized: true,
+        servername: cfg.supabase_host,
+        checkServerIdentity: tls.checkServerIdentity,
+        minVersion: 'TLSv1.2',
+      },
+      connectionTimeoutMillis: 8000,
+      statement_timeout: 8000,
     });
+    return { client, trust };
+  }
+
+  private extractVerifiedTlsDiagnostics(
+    client: PgClient,
+    trust: ResolvedPostgresCaTrust,
+    extraNote?: string
+  ): DbTlsDiagnostics {
+    const stream = (
+      client as unknown as {
+        connection?: { stream?: tls.TLSSocket };
+      }
+    )?.connection?.stream;
+    const protocol =
+      stream && typeof stream.getProtocol === 'function' ? stream.getProtocol() || 'TLSv1.2+' : 'TLSv1.2+';
+    const peer =
+      stream && typeof stream.getPeerCertificate === 'function'
+        ? stream.getPeerCertificate(false)
+        : undefined;
+    const subjectCn =
+      peer && peer.subject && typeof peer.subject.CN === 'string' ? peer.subject.CN : null;
+    const issuerCn =
+      peer && peer.issuer && typeof peer.issuer.CN === 'string' ? peer.issuer.CN : null;
+
+    return {
+      tls_enabled: true,
+      tls_protocol: protocol,
+      certificate_valid: true,
+      certificate_status: 'verified',
+      hostname_valid: true,
+      hostname_status: 'verified',
+      connection_status: 'connected',
+      ca_source: trust.caSources.join(' + '),
+      ca_bundle_count: trust.caList.length,
+      bundled_supabase_ca_loaded: trust.bundledSupabaseCaLoaded,
+      custom_ca_configured: trust.customCaConfigured,
+      custom_ca_subject: trust.customCaSubject,
+      custom_ca_fingerprint256: trust.customCaFingerprint256,
+      peer_subject_cn: subjectCn,
+      peer_issuer_cn: issuerCn,
+      diagnostic_summary:
+        extraNote ||
+        `Verified ${protocol} connection (${trust.caSources.join(' + ')}). Certificate chain and hostname validated.`,
+      missing_cert_guidance: null,
+      checked_at: new Date().toISOString(),
+    };
+  }
+
+  private classifyPgErrorDiagnostics(
+    err: unknown,
+    host: string,
+    password: string | undefined,
+    trust: ResolvedPostgresCaTrust
+  ): DbTlsDiagnostics {
+    const safeMsg = this.sanitizeDbError(err, password);
+    const code =
+      typeof err === 'object' && err !== null && 'code' in err
+        ? String((err as { code?: unknown }).code || '')
+        : '';
+    const lower = safeMsg.toLowerCase();
+
+    if (
+      code === 'SELF_SIGNED_CERT_IN_CHAIN' ||
+      code === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE' ||
+      code === 'DEPTH_ZERO_SELF_SIGNED_CERT' ||
+      lower.includes('self-signed certificate') ||
+      lower.includes('unable to verify the first certificate')
+    ) {
+      const missingParts: string[] = [];
+      if (!trust.bundledSupabaseCaLoaded) {
+        missingParts.push('Supabase Root 2021 CA (backend/certs/supabase-prod-ca-2021.crt)');
+      }
+      if (!trust.customCaConfigured) {
+        missingParts.push('matching custom Root CA PEM (via RG_DB_SSL_CA_CERT or protected Server CA upload)');
+      }
+      const guidance = `The PostgreSQL server presented an untrusted or incomplete CA chain (${code || 'SELF_SIGNED_CERT_IN_CHAIN'}). Missing trusted root certificate: ${missingParts.join(' or ')}.`;
+      return {
+        tls_enabled: true,
+        tls_protocol: null,
+        certificate_valid: false,
+        certificate_status: code === 'SELF_SIGNED_CERT_IN_CHAIN' ? 'self_signed_chain' : 'untrusted_ca',
+        hostname_valid: false,
+        hostname_status: 'not_checked',
+        connection_status: 'tls_error',
+        ca_source: trust.caSources.join(' + '),
+        ca_bundle_count: trust.caList.length,
+        bundled_supabase_ca_loaded: trust.bundledSupabaseCaLoaded,
+        custom_ca_configured: trust.customCaConfigured,
+        custom_ca_subject: trust.customCaSubject,
+        custom_ca_fingerprint256: trust.customCaFingerprint256,
+        peer_subject_cn: null,
+        peer_issuer_cn: null,
+        diagnostic_summary: safeMsg,
+        missing_cert_guidance: guidance,
+        checked_at: new Date().toISOString(),
+      };
+    }
+
+    if (
+      code === 'ERR_TLS_CERT_ALTNAME_INVALID' ||
+      lower.includes('altnames') ||
+      lower.includes('does not match cert')
+    ) {
+      return {
+        tls_enabled: true,
+        tls_protocol: null,
+        certificate_valid: true,
+        certificate_status: 'verified',
+        hostname_valid: false,
+        hostname_status: 'mismatch',
+        connection_status: 'tls_error',
+        ca_source: trust.caSources.join(' + '),
+        ca_bundle_count: trust.caList.length,
+        bundled_supabase_ca_loaded: trust.bundledSupabaseCaLoaded,
+        custom_ca_configured: trust.customCaConfigured,
+        custom_ca_subject: trust.customCaSubject,
+        custom_ca_fingerprint256: trust.customCaFingerprint256,
+        peer_subject_cn: null,
+        peer_issuer_cn: null,
+        diagnostic_summary: safeMsg,
+        missing_cert_guidance: `Server hostname '${host}' does not match the TLS certificate SAN. Verify the exact Supabase Direct or Supavisor Pooler hostname.`,
+        checked_at: new Date().toISOString(),
+      };
+    }
+
+    if (code === 'CERT_HAS_EXPIRED' || lower.includes('certificate has expired')) {
+      return {
+        tls_enabled: true,
+        tls_protocol: null,
+        certificate_valid: false,
+        certificate_status: 'expired',
+        hostname_valid: false,
+        hostname_status: 'not_checked',
+        connection_status: 'tls_error',
+        ca_source: trust.caSources.join(' + '),
+        ca_bundle_count: trust.caList.length,
+        bundled_supabase_ca_loaded: trust.bundledSupabaseCaLoaded,
+        custom_ca_configured: trust.customCaConfigured,
+        custom_ca_subject: trust.customCaSubject,
+        custom_ca_fingerprint256: trust.customCaFingerprint256,
+        peer_subject_cn: null,
+        peer_issuer_cn: null,
+        diagnostic_summary: safeMsg,
+        missing_cert_guidance: 'The server TLS certificate or trusted Root CA has expired. Obtain a current Root CA certificate from your database provider.',
+        checked_at: new Date().toISOString(),
+      };
+    }
+
+    if (code === '28P01' || code === '28000' || lower.includes('password authentication failed')) {
+      return {
+        tls_enabled: true,
+        tls_protocol: 'TLSv1.2+',
+        certificate_valid: true,
+        certificate_status: 'verified',
+        hostname_valid: true,
+        hostname_status: 'verified',
+        connection_status: 'auth_error',
+        ca_source: trust.caSources.join(' + '),
+        ca_bundle_count: trust.caList.length,
+        bundled_supabase_ca_loaded: trust.bundledSupabaseCaLoaded,
+        custom_ca_configured: trust.customCaConfigured,
+        custom_ca_subject: trust.customCaSubject,
+        custom_ca_fingerprint256: trust.customCaFingerprint256,
+        peer_subject_cn: null,
+        peer_issuer_cn: null,
+        diagnostic_summary: 'TLS certificate and hostname verified, but PostgreSQL rejected username/password.',
+        missing_cert_guidance: null,
+        checked_at: new Date().toISOString(),
+      };
+    }
+
+    return {
+      tls_enabled: true,
+      tls_protocol: null,
+      certificate_valid: false,
+      certificate_status: 'error',
+      hostname_valid: false,
+      hostname_status: 'error',
+      connection_status: 'network_error',
+      ca_source: trust.caSources.join(' + '),
+      ca_bundle_count: trust.caList.length,
+      bundled_supabase_ca_loaded: trust.bundledSupabaseCaLoaded,
+      custom_ca_configured: trust.customCaConfigured,
+      custom_ca_subject: trust.customCaSubject,
+      custom_ca_fingerprint256: trust.customCaFingerprint256,
+      peer_subject_cn: null,
+      peer_issuer_cn: null,
+      diagnostic_summary: safeMsg,
+      missing_cert_guidance: null,
+      checked_at: new Date().toISOString(),
+    };
+  }
+
+  public async testPostgresConnection(
+    cfg: DecryptedInfraConfig
+  ): Promise<{ ok: boolean; message: string; diagnostics: DbTlsDiagnostics }> {
+    const baseDiag = this.getCurrentTlsTrustDiagnostics();
+    if (!cfg.supabase_host || !cfg.supabase_password) {
+      return {
+        ok: false,
+        message: 'Enter and save your NEW Supabase hostname and database password first.',
+        diagnostics: baseDiag,
+      };
+    }
+
+    const { dirInfo } = this.getPaths();
+    const trust = resolvePostgresCaTrust(dirInfo.dir);
+    let client: PgClient | null = null;
 
     try {
+      const built = this.buildPgClientConfig(cfg);
+      client = built.client;
       await client.connect();
       const res = await client.query<{
         pg_version: string;
@@ -1026,24 +1527,34 @@ export class PermanentConfigStore {
         'SELECT current_setting(\'server_version\') AS pg_version, current_database() AS db_name, current_user AS db_user'
       );
       const row = res.rows[0];
+      const diag = this.extractVerifiedTlsDiagnostics(client, built.trust);
       return {
         ok: true,
         message: `Connected & authenticated to NEW Supabase PostgreSQL ${
           row?.pg_version || ''
         } (db=${row?.db_name || cfg.supabase_db_name}, user=${
           row?.db_user || cfg.supabase_user
-        }, SSL=${cfg.db_ssl_require ? 'verified' : 'off'}). Ready for SQL migration.`,
+        }, TLS=${diag.tls_protocol}, CA=verified, hostname=verified). Ready for SQL migration.`,
+        diagnostics: diag,
       };
     } catch (err) {
+      const diag = this.classifyPgErrorDiagnostics(
+        err,
+        cfg.supabase_host,
+        cfg.supabase_password,
+        trust
+      );
       return {
         ok: false,
-        message: `Pre-migration PostgreSQL connection failed: ${this.sanitizeDbError(
-          err,
-          cfg.supabase_password
-        )}`,
+        message: `Pre-migration PostgreSQL connection failed: ${
+          diag.missing_cert_guidance || this.sanitizeDbError(err, cfg.supabase_password)
+        }`,
+        diagnostics: diag,
       };
     } finally {
-      await client.end().catch(() => {});
+      if (client) {
+        await client.end().catch(() => {});
+      }
     }
   }
 
@@ -1054,7 +1565,9 @@ export class PermanentConfigStore {
     found_tables: string[];
     missing_tables: string[];
     message: string;
+    diagnostics: DbTlsDiagnostics;
   }> {
+    const baseDiag = this.getCurrentTlsTrustDiagnostics();
     if (!cfg.supabase_host || !cfg.supabase_password) {
       return {
         ok: false,
@@ -1063,21 +1576,17 @@ export class PermanentConfigStore {
         found_tables: [],
         missing_tables: [...REQUIRED_TABLES_20],
         message: 'Save and test your NEW Supabase project connection before verifying tables.',
+        diagnostics: baseDiag,
       };
     }
 
-    const client = new PgClient({
-      host: cfg.supabase_host,
-      port: cfg.supabase_port,
-      user: cfg.supabase_user || 'postgres',
-      database: cfg.supabase_db_name || 'postgres',
-      password: cfg.supabase_password,
-      ssl: cfg.db_ssl_require ? { rejectUnauthorized: true } : false,
-      connectionTimeoutMillis: 6000,
-      statement_timeout: 6000,
-    });
+    const { dirInfo } = this.getPaths();
+    const trust = resolvePostgresCaTrust(dirInfo.dir);
+    let client: PgClient | null = null;
 
     try {
+      const built = this.buildPgClientConfig(cfg);
+      client = built.client;
       await client.connect();
       const res = await client.query<{ table_name: string }>(
         `SELECT table_name
@@ -1085,6 +1594,7 @@ export class PermanentConfigStore {
          WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
          ORDER BY table_name`
       );
+      const diag = this.extractVerifiedTlsDiagnostics(client, built.trust);
       const existing = new Set(res.rows.map((r) => r.table_name));
       const foundTables = REQUIRED_TABLES_20.filter((t) => existing.has(t));
       const missingTables = REQUIRED_TABLES_20.filter((t) => !existing.has(t));
@@ -1099,41 +1609,69 @@ export class PermanentConfigStore {
         message: ok
           ? `All 20/20 required RG Studio tables verified in NEW Supabase project (${cfg.supabase_db_name}). Database setup is complete.`
           : `Found ${foundTables.length}/20 required tables in NEW Supabase project. Missing ${missingTables.length} table(s): ${missingTables.join(', ')}. Run the copied SQL schema in Supabase SQL Editor first.`,
+        diagnostics: diag,
       };
     } catch (err) {
+      const diag = this.classifyPgErrorDiagnostics(
+        err,
+        cfg.supabase_host,
+        cfg.supabase_password,
+        trust
+      );
       return {
         ok: false,
         found_count: 0,
         required_count: REQUIRED_TABLES_20.length,
         found_tables: [],
         missing_tables: [...REQUIRED_TABLES_20],
-        message: `Table verification query failed: ${this.sanitizeDbError(
-          err,
-          cfg.supabase_password
-        )}`,
+        message: `Table verification query failed: ${
+          diag.missing_cert_guidance || this.sanitizeDbError(err, cfg.supabase_password)
+        }`,
+        diagnostics: diag,
       };
     } finally {
-      await client.end().catch(() => {});
+      if (client) {
+        await client.end().catch(() => {});
+      }
     }
   }
 
   public async probePostgresTls(
     host: string,
     port: number
-  ): Promise<{ ok: boolean; message: string }> {
+  ): Promise<{ ok: boolean; message: string; diagnostics: DbTlsDiagnostics }> {
+    const { dirInfo } = this.getPaths();
+    const trust = resolvePostgresCaTrust(dirInfo.dir);
+    if (trust.configError) {
+      return {
+        ok: false,
+        message: trust.configError,
+        diagnostics: this.classifyPgErrorDiagnostics(new Error(trust.configError), host, undefined, trust),
+      };
+    }
+
     return new Promise((resolve) => {
       const socket = net.createConnection({ host, port });
       let settled = false;
-      const done = (ok: boolean, message: string) => {
+      const done = (ok: boolean, message: string, diagnostics: DbTlsDiagnostics) => {
         if (settled) return;
         settled = true;
         socket.destroy();
-        resolve({ ok, message });
+        resolve({ ok, message, diagnostics });
       };
 
-      socket.setTimeout(5000);
-      socket.on('timeout', () => done(false, `Timed out connecting to ${host}:${port} after 5s.`));
-      socket.on('error', (err) => done(false, `Connection error: ${err.message}`));
+      socket.setTimeout(6000);
+      socket.on('timeout', () => {
+        const msg = `Timed out connecting to ${host}:${port} after 6s.`;
+        done(false, msg, this.classifyPgErrorDiagnostics(new Error(msg), host, undefined, trust));
+      });
+      socket.on('error', (err) => {
+        done(
+          false,
+          `Connection error: ${err.message}`,
+          this.classifyPgErrorDiagnostics(err, host, undefined, trust)
+        );
+      });
 
       socket.on('connect', () => {
         const sslReq = Buffer.alloc(8);
@@ -1144,14 +1682,53 @@ export class PermanentConfigStore {
 
       socket.once('data', (chunk) => {
         if (chunk.length === 1 && chunk[0] === 0x53) {
-          const tlsSock = tls.connect({ socket, servername: host, rejectUnauthorized: true }, () => {
-            const proto = tlsSock.getProtocol() || 'TLS';
-            tlsSock.end();
-            done(true, `Supabase PostgreSQL host reachable and ${proto} certificate verified.`);
+          const tlsSock = tls.connect(
+            {
+              socket,
+              servername: host,
+              ca: trust.caList,
+              rejectUnauthorized: true,
+              checkServerIdentity: tls.checkServerIdentity,
+              minVersion: 'TLSv1.2',
+            },
+            () => {
+              const proto = tlsSock.getProtocol() || 'TLSv1.2+';
+              const peer = tlsSock.getPeerCertificate(false);
+              const diag: DbTlsDiagnostics = {
+                tls_enabled: true,
+                tls_protocol: proto,
+                certificate_valid: true,
+                certificate_status: 'verified',
+                hostname_valid: true,
+                hostname_status: 'verified',
+                connection_status: 'connected',
+                ca_source: trust.caSources.join(' + '),
+                ca_bundle_count: trust.caList.length,
+                bundled_supabase_ca_loaded: trust.bundledSupabaseCaLoaded,
+                custom_ca_configured: trust.customCaConfigured,
+                custom_ca_subject: trust.customCaSubject,
+                custom_ca_fingerprint256: trust.customCaFingerprint256,
+                peer_subject_cn: typeof peer?.subject?.CN === 'string' ? peer.subject.CN : null,
+                peer_issuer_cn: typeof peer?.issuer?.CN === 'string' ? peer.issuer.CN : null,
+                diagnostic_summary: `Verified ${proto} TLS handshake and hostname for ${host}:${port}.`,
+                missing_cert_guidance: null,
+                checked_at: new Date().toISOString(),
+              };
+              tlsSock.end();
+              done(true, `Supabase PostgreSQL host reachable and ${proto} certificate & hostname verified.`, diag);
+            }
+          );
+          tlsSock.on('error', (err) => {
+            const diag = this.classifyPgErrorDiagnostics(err, host, undefined, trust);
+            done(
+              false,
+              `TLS handshake failed: ${diag.missing_cert_guidance || err.message}`,
+              diag
+            );
           });
-          tlsSock.on('error', (err) => done(false, `TLS handshake failed: ${err.message}`));
         } else {
-          done(false, 'Host responded, but refused PostgreSQL SSL/TLS upgrade.');
+          const msg = 'Host responded, but refused PostgreSQL SSL/TLS upgrade.';
+          done(false, msg, this.classifyPgErrorDiagnostics(new Error(msg), host, undefined, trust));
         }
       });
     });
@@ -1259,6 +1836,7 @@ export class PermanentConfigStore {
           last_db_test_ok: dbProbe.ok,
           last_db_test_message: dbProbe.message,
           last_db_test_at: new Date().toISOString(),
+          last_db_tls_diagnostics: dbProbe.diagnostics,
         },
         undefined,
         { markSavedNow: false, preserveVerification: true }

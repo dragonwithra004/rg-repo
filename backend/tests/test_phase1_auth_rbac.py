@@ -62,8 +62,30 @@ def test_supabase_asyncpg_ssl_and_pooler_config():
     )
     clean_url, connect_args = build_asyncpg_engine_config(cfg)
     assert "sslmode=" not in clean_url
-    assert isinstance(connect_args.get("ssl"), ssl.SSLContext)
+    ctx = connect_args.get("ssl")
+    assert isinstance(ctx, ssl.SSLContext)
+    assert ctx.verify_mode == ssl.CERT_REQUIRED
+    assert ctx.check_hostname is True
+    assert ctx.minimum_version >= ssl.TLSVersion.TLSv1_2
     assert connect_args.get("statement_cache_size") == 0
+
+
+def test_rejects_insecure_sslmode_and_disabled_ssl():
+    with pytest.raises(ValueError):
+        build_asyncpg_engine_config(
+            Settings(
+                database_url="postgresql+asyncpg://user:pass@pooler-host:6543/postgres?sslmode=disable",
+                db_ssl_require=True,
+            )
+        )
+
+    with pytest.raises(RuntimeError):
+        build_asyncpg_engine_config(
+            Settings(
+                database_url="postgresql+asyncpg://user:pass@pooler-host:6543/postgres",
+                db_ssl_require=False,
+            )
+        )
 
 
 def test_production_rejects_missing_db_or_unsafe_jwt():

@@ -6,6 +6,7 @@ import express, { NextFunction, Request, Response } from 'express';
 import { createServer as createViteServer } from 'vite';
 import {
   DecryptedInfraConfig,
+  parsePostgresConnectionUri,
   PermanentConfigStore,
   REQUIRED_TABLES_20,
 } from './server/configStore';
@@ -729,6 +730,8 @@ async function startServer() {
       last_db_test_ok: cfg.last_db_test_ok,
       last_db_test_message: cfg.last_db_test_message,
       last_db_test_at: cfg.last_db_test_at,
+      db_tls_diagnostics:
+        cfg.last_db_tls_diagnostics || configStore.getCurrentTlsTrustDiagnostics(),
       last_backend_test_ok: cfg.last_backend_test_ok,
       last_backend_test_message: cfg.last_backend_test_message,
       last_backend_test_at: cfg.last_backend_test_at,
@@ -779,30 +782,33 @@ async function startServer() {
   });
 
   app.put('/api/v1/admin/infra/database', requireAuth, requireAdmin, (req: AuthedRequest, res) => {
+    if (req.body?.db_ssl_require === false) {
+      return res.status(400).json({
+        detail:
+          'Disabling SSL/TLS verification is prohibited. RG Studio requires verified TLS (verify-full) for Supabase PostgreSQL.',
+      });
+    }
+
     const rawUri = String(req.body?.connection_uri || '').trim();
     let nextHost = '';
     let nextPort = 6543;
     let nextUser = 'postgres';
     let nextDbName = 'postgres';
     let nextPassword: string | undefined;
+    let detectedPooler: boolean | undefined;
 
     if (rawUri) {
       try {
-        const normalized = rawUri.replace(/^postgresql\+(asyncpg|psycopg):\/\//, 'postgresql://');
-        const parsed = new URL(normalized);
-        if (!parsed.hostname) {
-          return res.status(400).json({ detail: 'Connection URI must include a valid host.' });
-        }
-        nextHost = parsed.hostname;
-        nextPort = parsed.port ? Number(parsed.port) : 6543;
-        nextUser = decodeURIComponent(parsed.username || 'postgres');
-        nextDbName = parsed.pathname.replace(/^\//, '') || 'postgres';
-        if (parsed.password) {
-          nextPassword = decodeURIComponent(parsed.password);
-        }
-      } catch {
+        const parsed = parsePostgresConnectionUri(rawUri);
+        nextHost = parsed.host;
+        nextPort = parsed.port;
+        nextUser = parsed.user;
+        nextDbName = parsed.database;
+        nextPassword = parsed.password;
+        detectedPooler = parsed.isPooler;
+      } catch (err) {
         return res.status(400).json({
-          detail: 'Invalid PostgreSQL connection URI format.',
+          detail: err instanceof Error ? err.message : 'Invalid PostgreSQL connection URI format.',
         });
       }
     } else {
@@ -826,16 +832,16 @@ async function startServer() {
         supabase_port: nextPort,
         supabase_user: nextUser,
         supabase_db_name: nextDbName,
-        db_ssl_require:
-          typeof req.body?.db_ssl_require === 'boolean' ? req.body.db_ssl_require : undefined,
+        db_ssl_require: true,
         db_pooler_mode:
-          typeof req.body?.db_pooler_mode === 'boolean' ? req.body.db_pooler_mode : undefined,
+          typeof req.body?.db_pooler_mode === 'boolean' ? req.body.db_pooler_mode : detectedPooler,
         db_project_label: 'NEW Supabase Project',
         is_new_supabase_project: true,
         explicit_db_reset: false,
         last_db_test_ok: null,
         last_db_test_message: null,
         last_db_test_at: null,
+        last_db_tls_diagnostics: null,
         sql_migration_confirmed: false,
         tables_verified: false,
         verified_tables_count: 0,
@@ -896,6 +902,7 @@ async function startServer() {
         last_db_test_ok: result.ok,
         last_db_test_message: result.message,
         last_db_test_at: new Date().toISOString(),
+        last_db_tls_diagnostics: result.diagnostics,
       },
       undefined,
       { markSavedNow: false, preserveVerification: true }
@@ -917,6 +924,57 @@ async function startServer() {
     return res.json(buildMaskedStatus(updated, store));
   });
 
+  app.put('/api/v1/admin/infra/db-ca', requireAuth, requireAdmin, (req: AuthedRequest, res) => {
+    try {
+      const caPem = String(req.body?.ca_pem || '');
+      const diag = configStore.saveCustomDbCaCertificate(caPem);
+      const updated = configStore.saveConfig(
+        { last_db_tls_diagnostics: diag },
+        undefined,
+        { markSavedNow: false, preserveVerification: true }
+      );
+      const store = readStore();
+      store.audit_logs.unshift({
+        id: crypto.randomUUID(),
+        actor_user_id: req.actor!.id,
+        actor_username: req.actor!.username,
+        action: 'INFRA_DB_CA_UPDATED',
+        record_type: 'app_settings',
+        record_id: null,
+        details: `Saved protected server-side PostgreSQL CA certificate (${diag.custom_ca_fingerprint256 || 'verified'}).`,
+        created_at: new Date().toISOString(),
+      });
+      writeStore(store);
+      return res.json(buildMaskedStatus(updated, store));
+    } catch (err) {
+      return res.status(400).json({
+        detail: err instanceof Error ? err.message : 'Unable to save PostgreSQL CA certificate.',
+      });
+    }
+  });
+
+  app.delete('/api/v1/admin/infra/db-ca', requireAuth, requireAdmin, (req: AuthedRequest, res) => {
+    const diag = configStore.clearCustomDbCaCertificate();
+    const updated = configStore.saveConfig(
+      { last_db_tls_diagnostics: diag },
+      undefined,
+      { markSavedNow: false, preserveVerification: true }
+    );
+    const store = readStore();
+    store.audit_logs.unshift({
+      id: crypto.randomUUID(),
+      actor_user_id: req.actor!.id,
+      actor_username: req.actor!.username,
+      action: 'INFRA_DB_CA_REMOVED',
+      record_type: 'app_settings',
+      record_id: null,
+      details: 'Removed optional custom PostgreSQL CA certificate; using System Roots + bundled Supabase Root 2021 CA.',
+      created_at: new Date().toISOString(),
+    });
+    writeStore(store);
+    return res.json(buildMaskedStatus(updated, store));
+  });
+
   app.post('/api/v1/admin/infra/verify-tables', requireAuth, requireAdmin, async (req: AuthedRequest, res) => {
     const cfg = configStore.readConfig();
     if (!cfg.supabase_host || !cfg.supabase_password) {
@@ -934,6 +992,7 @@ async function startServer() {
         missing_tables: check.missing_tables,
         last_table_verify_at: new Date().toISOString(),
         last_table_verify_message: check.message,
+        last_db_tls_diagnostics: check.diagnostics,
       },
       undefined,
       { markSavedNow: false, preserveVerification: true }
@@ -1269,7 +1328,7 @@ async function startServer() {
     const dbName = cfg.supabase_db_name || 'postgres';
     const asyncUrl = `postgresql+asyncpg://${encUser}:__ENTER_NEW_SUPABASE_PASSWORD__@${cfg.supabase_host}:${cfg.supabase_port}/${dbName}`;
     const syncPort = cfg.supabase_port === 6543 ? 5432 : cfg.supabase_port;
-    const syncUrl = `postgresql+psycopg://${encUser}:__ENTER_NEW_SUPABASE_PASSWORD__@${cfg.supabase_host}:${syncPort}/${dbName}?sslmode=require`;
+    const syncUrl = `postgresql+psycopg://${encUser}:__ENTER_NEW_SUPABASE_PASSWORD__@${cfg.supabase_host}:${syncPort}/${dbName}?sslmode=verify-full`;
 
     // Strictly redact passwords, JWT secrets, and encryption keys from HTTP responses
     const envText = [
@@ -1281,8 +1340,9 @@ async function startServer() {
       'RG_API_V1_PREFIX=/api/v1',
       `RG_DATABASE_URL=${asyncUrl}`,
       `RG_DATABASE_SYNC_URL=${syncUrl}`,
-      `RG_DB_SSL_REQUIRE=${cfg.db_ssl_require ? 'true' : 'false'}`,
+      'RG_DB_SSL_REQUIRE=true',
       `RG_DB_POOLER_MODE=${cfg.db_pooler_mode ? 'true' : 'false'}`,
+      'RG_DB_SSL_CA_FILE=certs/supabase-prod-ca-2021.crt',
       'RG_JWT_SECRET_KEY=__SET_IN_HOSTING_SECRET_MANAGER__',
       'RG_JWT_REFRESH_SECRET_KEY=__SET_IN_HOSTING_SECRET_MANAGER__',
       'RG_SETUP_BOOTSTRAP_TOKEN=__SET_IN_HOSTING_SECRET_MANAGER__',

@@ -97,6 +97,26 @@ interface InfraStatus {
   last_db_test_ok: boolean | null;
   last_db_test_message: string | null;
   last_db_test_at: string | null;
+  db_tls_diagnostics: {
+    tls_enabled: boolean;
+    tls_protocol: string | null;
+    certificate_valid: boolean;
+    certificate_status: string;
+    hostname_valid: boolean;
+    hostname_status: string;
+    connection_status: string;
+    ca_source: string;
+    ca_bundle_count: number;
+    bundled_supabase_ca_loaded: boolean;
+    custom_ca_configured: boolean;
+    custom_ca_subject: string | null;
+    custom_ca_fingerprint256: string | null;
+    peer_subject_cn: string | null;
+    peer_issuer_cn: string | null;
+    diagnostic_summary: string;
+    missing_cert_guidance: string | null;
+    checked_at: string | null;
+  } | null;
   last_backend_test_ok: boolean | null;
   last_backend_test_message: string | null;
   last_backend_test_at: string | null;
@@ -172,13 +192,18 @@ export const AdminInfraSetupView: React.FC<AdminInfraSetupViewProps> = ({
   const [showCustomNewKey, setShowCustomNewKey] = useState(false);
   const [activationConfirmation, setActivationConfirmation] = useState('');
 
+  // Optional custom server-side PostgreSQL Root CA uploader state
+  const [showCustomCaPanel, setShowCustomCaPanel] = useState(false);
+  const [customCaPem, setCustomCaPem] = useState('');
+  const caFileInputRef = useRef<HTMLInputElement | null>(null);
+
   const applyLoadedStatus = useCallback((data: InfraStatus) => {
     setStatus(data);
     setHost(data.supabase_host || '');
     setPort(String(data.supabase_port || 6543));
     setDbUser(data.supabase_user || 'postgres');
     setDbName(data.supabase_db_name || 'postgres');
-    setSslRequire(Boolean(data.db_ssl_require));
+    setSslRequire(true);
     setPoolerMode(Boolean(data.db_pooler_mode));
     setFastapiUrl(data.fastapi_base_url || '');
     setEditingDb(!data.has_database_config);
@@ -322,13 +347,78 @@ export const AdminInfraSetupView: React.FC<AdminInfraSetupViewProps> = ({
       applyLoadedStatus(data);
       if (data.last_db_test_ok) {
         setNotice(
-          'Pre-migration connection test passed! Next: Copy the 20-table schema SQL below, run it in your NEW Supabase SQL Editor, then click "Verify All 20 Required Tables".'
+          'Pre-migration connection test passed with verified TLS & hostname validation! Next: Copy the 20-table schema SQL below, run it in your NEW Supabase SQL Editor, then click "Verify All 20 Required Tables".'
         );
       } else {
         setError(data.last_db_test_message || 'Pre-migration connection failed.');
       }
     } catch {
       setError('Unable to run server database connection check.');
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const handleCaFileSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const text = await file.text();
+    setCustomCaPem(text);
+  };
+
+  const handleSaveCustomCa = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!requireOnline()) return;
+    setError(null);
+    setNotice(null);
+    setBusyAction('save_db_ca');
+    try {
+      const res = await fetch('/api/v1/admin/infra/db-ca', {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        credentials: 'same-origin',
+        body: JSON.stringify({ ca_pem: customCaPem }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setError(data.detail || 'Unable to save PostgreSQL CA certificate.');
+        return;
+      }
+      applyLoadedStatus(data);
+      setCustomCaPem('');
+      setShowCustomCaPanel(false);
+      if (caFileInputRef.current) caFileInputRef.current.value = '';
+      setNotice('Protected server-side PostgreSQL Root CA certificate saved (0600). Run Pre-Migration Connection Test to verify.');
+    } catch {
+      setError('Network error saving PostgreSQL CA certificate.');
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const handleRemoveCustomCa = async () => {
+    if (!requireOnline()) return;
+    setError(null);
+    setNotice(null);
+    setBusyAction('remove_db_ca');
+    try {
+      const res = await fetch('/api/v1/admin/infra/db-ca', {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` },
+        credentials: 'same-origin',
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setError(data.detail || 'Unable to remove custom CA certificate.');
+        return;
+      }
+      applyLoadedStatus(data);
+      setNotice('Optional custom CA certificate removed. Using System Roots + bundled Supabase Root 2021 CA.');
+    } catch {
+      setError('Network error removing custom CA certificate.');
     } finally {
       setBusyAction(null);
     }
@@ -1357,13 +1447,9 @@ export const AdminInfraSetupView: React.FC<AdminInfraSetupViewProps> = ({
             </div>
 
             <div className="flex flex-wrap gap-6 text-xs text-slate-700 dark:text-slate-300">
-              <label className="flex items-center gap-2 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={sslRequire}
-                  onChange={(e) => setSslRequire(e.target.checked)}
-                />
-                <span>Require TLS SSL (Supabase mandatory)</span>
+              <label className="flex items-center gap-2 cursor-not-allowed opacity-90">
+                <input type="checkbox" checked={sslRequire} readOnly disabled />
+                <span>Require Verified TLS SSL (verify-full · Mandatory Security)</span>
               </label>
               <label className="flex items-center gap-2 cursor-pointer">
                 <input
@@ -1399,18 +1485,19 @@ export const AdminInfraSetupView: React.FC<AdminInfraSetupViewProps> = ({
         )}
       </section>
 
-      {/* Step 2: Pre-Migration Connection Test */}
+      {/* Step 2: Pre-Migration Connection Test & TLS Verification Diagnostics */}
       <section className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg p-6 space-y-4">
         <div className="flex items-center justify-between gap-4">
           <div className="flex items-center gap-2.5">
             <RefreshCw className="w-5 h-5 text-blue-600 dark:text-blue-400 shrink-0" />
             <div>
               <h2 className="text-base font-semibold">
-                Step 2 — Pre-Migration Connection Test (Before Running SQL)
+                Step 2 — Pre-Migration Connection Test &amp; TLS Diagnostics (Before Running SQL)
               </h2>
               <p className="text-xs text-slate-500 dark:text-slate-400">
-                Verifies hostname, port, username, password, and TLS SSL against your NEW Supabase
-                project without executing any SQL or modifying tables.
+                Verifies hostname, port, username, password, CA certificate chain, and hostname
+                identity against your NEW Supabase project without executing any SQL or modifying
+                tables.
               </p>
             </div>
           </div>
@@ -1436,7 +1523,159 @@ export const AdminInfraSetupView: React.FC<AdminInfraSetupViewProps> = ({
               ? 'Testing NEW Supabase Connection...'
               : 'Test NEW Supabase Connection (Pre-Migration)'}
           </button>
+          <button
+            type="button"
+            onClick={() => setShowCustomCaPanel((prev) => !prev)}
+            className="px-3.5 py-2 text-xs font-medium rounded-md border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800"
+          >
+            {showCustomCaPanel
+              ? 'Hide Custom SSL CA Settings'
+              : 'Optional: Custom SSL Root CA (.crt/.pem)'}
+          </button>
         </div>
+
+        {status.db_tls_diagnostics && (
+          <div className="p-4 rounded-md border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950/50 space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="text-xs font-semibold text-slate-800 dark:text-slate-200">
+                PostgreSQL TLS &amp; Certificate Verification Diagnostics
+              </div>
+              <span className="text-[11px] font-mono text-slate-500">
+                {status.db_tls_diagnostics.ca_bundle_count} trusted root CAs loaded
+              </span>
+            </div>
+
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 text-xs">
+              <div className="p-2.5 rounded border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900">
+                <div className="text-[11px] text-slate-500">TLS Enabled</div>
+                <div className="font-semibold mt-0.5 text-emerald-700 dark:text-emerald-400">
+                  {status.db_tls_diagnostics.tls_enabled
+                    ? `Enforced (${status.db_tls_diagnostics.tls_protocol || 'TLS 1.2+'})`
+                    : 'Off'}
+                </div>
+              </div>
+              <div className="p-2.5 rounded border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900">
+                <div className="text-[11px] text-slate-500">Certificate Validation</div>
+                <div
+                  className={`font-semibold mt-0.5 ${
+                    status.db_tls_diagnostics.certificate_valid
+                      ? 'text-emerald-700 dark:text-emerald-400'
+                      : status.db_tls_diagnostics.certificate_status === 'not_checked'
+                        ? 'text-amber-600 dark:text-amber-400'
+                        : 'text-red-600 dark:text-red-400'
+                  }`}
+                >
+                  {status.db_tls_diagnostics.certificate_valid
+                    ? 'Verified'
+                    : status.db_tls_diagnostics.certificate_status}
+                </div>
+              </div>
+              <div className="p-2.5 rounded border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900">
+                <div className="text-[11px] text-slate-500">Hostname Validation</div>
+                <div
+                  className={`font-semibold mt-0.5 ${
+                    status.db_tls_diagnostics.hostname_valid
+                      ? 'text-emerald-700 dark:text-emerald-400'
+                      : status.db_tls_diagnostics.hostname_status === 'not_checked'
+                        ? 'text-amber-600 dark:text-amber-400'
+                        : 'text-red-600 dark:text-red-400'
+                  }`}
+                >
+                  {status.db_tls_diagnostics.hostname_valid
+                    ? 'Verified'
+                    : status.db_tls_diagnostics.hostname_status}
+                </div>
+              </div>
+              <div className="p-2.5 rounded border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900">
+                <div className="text-[11px] text-slate-500">Connection Status</div>
+                <div
+                  className={`font-semibold mt-0.5 ${
+                    status.db_tls_diagnostics.connection_status === 'connected'
+                      ? 'text-emerald-700 dark:text-emerald-400'
+                      : status.db_tls_diagnostics.connection_status === 'not_configured'
+                        ? 'text-amber-600 dark:text-amber-400'
+                        : 'text-red-600 dark:text-red-400'
+                  }`}
+                >
+                  {status.db_tls_diagnostics.connection_status === 'connected'
+                    ? 'Connected'
+                    : status.db_tls_diagnostics.connection_status}
+                </div>
+              </div>
+            </div>
+
+            <div className="text-[11px] text-slate-600 dark:text-slate-400 space-y-1 font-mono">
+              <div>CA Trust Chain: {status.db_tls_diagnostics.ca_source}</div>
+              {status.db_tls_diagnostics.peer_subject_cn && (
+                <div>
+                  Peer Certificate: CN={status.db_tls_diagnostics.peer_subject_cn} · Issuer=
+                  {status.db_tls_diagnostics.peer_issuer_cn || 'Unknown'}
+                </div>
+              )}
+              {status.db_tls_diagnostics.custom_ca_configured && (
+                <div>
+                  Custom Server CA Active: {status.db_tls_diagnostics.custom_ca_subject || 'Loaded'}{' '}
+                  ({status.db_tls_diagnostics.custom_ca_fingerprint256?.slice(0, 23)}…)
+                </div>
+              )}
+            </div>
+
+            {status.db_tls_diagnostics.missing_cert_guidance && (
+              <div className="p-2.5 rounded border border-amber-300 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/40 text-xs text-amber-900 dark:text-amber-200">
+                {status.db_tls_diagnostics.missing_cert_guidance}
+              </div>
+            )}
+          </div>
+        )}
+
+        {showCustomCaPanel && (
+          <form
+            onSubmit={handleSaveCustomCa}
+            className="p-4 rounded-md border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950/40 space-y-3"
+          >
+            <div className="text-xs font-semibold">
+              Protected Server-Side SSL Root CA Certificate (Optional)
+            </div>
+            <p className="text-xs text-slate-600 dark:text-slate-400">
+              Supabase Root 2021 CA (<code className="font-mono">prod-ca-2021.crt</code>) is already
+              bundled and trusted automatically. Only upload a custom CA if connecting to a database
+              using a different private Root CA. Saved server-side only (<code className="font-mono">0600</code>).
+            </p>
+            <input
+              ref={caFileInputRef}
+              type="file"
+              accept=".crt,.pem,.cer"
+              onChange={handleCaFileSelected}
+              className="block w-full text-xs text-slate-600 dark:text-slate-300 file:mr-3 file:py-1.5 file:px-3 file:rounded-md file:border file:border-slate-300 dark:file:border-slate-700 file:text-xs file:font-medium file:bg-slate-100 dark:file:bg-slate-800"
+            />
+            <textarea
+              rows={4}
+              value={customCaPem}
+              onChange={(e) => setCustomCaPem(e.target.value)}
+              placeholder="-----BEGIN CERTIFICATE-----&#10;...&#10;-----END CERTIFICATE-----"
+              className="w-full px-3 py-2 text-xs font-mono rounded-md border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950"
+            />
+            <div className="flex flex-wrap items-center gap-3">
+              <button
+                type="submit"
+                disabled={busyAction === 'save_db_ca' || !customCaPem.trim()}
+                className="px-3.5 py-1.5 text-xs font-semibold rounded-md bg-blue-600 hover:bg-blue-700 text-white disabled:opacity-50"
+              >
+                Save Protected Server CA
+              </button>
+              {status.db_tls_diagnostics?.custom_ca_configured && (
+                <button
+                  type="button"
+                  onClick={handleRemoveCustomCa}
+                  disabled={busyAction === 'remove_db_ca'}
+                  className="px-3.5 py-1.5 text-xs font-medium rounded-md border border-red-300 dark:border-red-800 text-red-700 dark:text-red-300 hover:bg-red-50 dark:hover:bg-red-950/40"
+                >
+                  Remove Custom CA
+                </button>
+              )}
+            </div>
+          </form>
+        )}
 
         {status.last_db_test_message && (
           <div

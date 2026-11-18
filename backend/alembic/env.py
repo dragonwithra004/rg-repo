@@ -7,6 +7,7 @@ from sqlalchemy import create_engine, pool
 
 from app.core.config import get_settings
 from app.db.base import Base
+from app.db.session import resolve_sync_ca_bundle_path, sanitize_postgres_url
 import app.models  # noqa: F401  Ensure all 20 models register on Base.metadata
 
 config = context.config
@@ -23,10 +24,16 @@ def _get_sync_url_and_args() -> tuple[str, dict]:
         raise RuntimeError(
             "RG_DATABASE_SYNC_URL is not configured. Set postgresql+psycopg://... before running Alembic."
         )
-    connect_args = {}
-    if settings.db_ssl_require and "sslmode=" not in settings.database_sync_url:
-        connect_args["sslmode"] = "require"
-    return settings.database_sync_url, connect_args
+    if not settings.db_ssl_require:
+        raise RuntimeError(
+            "RG_DB_SSL_REQUIRE=false is prohibited. Verified TLS (verify-full) is required."
+        )
+    clean_url = sanitize_postgres_url(settings.database_sync_url)
+    connect_args: dict[str, str] = {"sslmode": "verify-full"}
+    ca_bundle = resolve_sync_ca_bundle_path(settings)
+    if ca_bundle is not None:
+        connect_args["sslrootcert"] = str(ca_bundle)
+    return clean_url, connect_args
 
 
 def run_migrations_offline() -> None:

@@ -17,6 +17,11 @@ RUN pip install --no-cache-dir --upgrade pip && \
 COPY backend /app/backend
 COPY migrations /app/migrations
 
+RUN if [ -f /app/backend/certs/supabase-prod-ca-2021.crt ]; then \
+      cp /app/backend/certs/supabase-prod-ca-2021.crt /usr/local/share/ca-certificates/supabase-prod-ca-2021.crt && \
+      update-ca-certificates; \
+    fi
+
 WORKDIR /app/backend
 
 EXPOSE 8000

@@ -14,6 +14,8 @@ rgstudio-config.enc.json
 .rgstudio-key-migration.stage.json
 .rgstudio-hosting-secrets.env
 .rgstudio-pre-migration-backup.rgcfg
+.rgstudio-db-ca.crt
+.rgstudio-combined-pg-ca.crt
 *.rgcfg
 __pycache__/
 *.py[cod]

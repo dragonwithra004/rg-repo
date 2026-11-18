@@ -23,6 +23,8 @@ class Settings(BaseSettings):
     database_sync_url: str = Field(default="")
     db_ssl_require: bool = Field(default=True)
     db_pooler_mode: bool = Field(default=True)
+    db_ssl_ca_file: str = Field(default="")
+    db_ssl_ca_cert: str = Field(default="")
 
     jwt_secret_key: str = Field(default="dev-only-unsafe-change-in-production-32chars")
     jwt_refresh_secret_key: str = Field(
@@ -76,6 +78,10 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def validate_production_secrets(self) -> "Settings":
         if self.environment.lower() == "production":
+            if not self.db_ssl_require:
+                raise ValueError(
+                    "Strict PostgreSQL TLS verification (RG_DB_SSL_REQUIRE=true) cannot be disabled in production."
+                )
             if not self.database_url or not self.database_sync_url:
                 raise ValueError(
                     "RG_DATABASE_URL and RG_DATABASE_SYNC_URL are required in production."

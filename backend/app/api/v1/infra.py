@@ -34,6 +34,7 @@ async def test_admin_db_connection(
         "masked_db_host": state.masked_db_host,
         "restored_at": state.restored_at,
         "last_error": state.last_error,
+        "tls_diagnostics": state.tls_diagnostics,
     }
 
 
