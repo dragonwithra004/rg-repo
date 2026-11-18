@@ -1,0 +1,8 @@
+{
+  "name": "RG Studio Management System",
+  "description": "Enterprise asset, employee, SIM, Gmail, and YouTube channel management platform for RG Studio (Phase 1 Foundation).",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

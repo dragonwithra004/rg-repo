@@ -1,0 +1,30 @@
+# Render.com Blueprint for one-click FastAPI backend deployment (no manual CLI required)
+services:
+  - type: web
+    name: rg-studio-management-api
+    runtime: docker
+    dockerContext: .
+    dockerfilePath: backend/Dockerfile
+    plan: starter
+    healthCheckPath: /api/v1/health
+    envVars:
+      - key: RG_ENVIRONMENT
+        value: production
+      - key: RG_DB_SSL_REQUIRE
+        value: "true"
+      - key: RG_DB_POOLER_MODE
+        value: "true"
+      - key: RG_DATABASE_URL
+        sync: false
+      - key: RG_DATABASE_SYNC_URL
+        sync: false
+      - key: RG_JWT_SECRET_KEY
+        generateValue: true
+      - key: RG_JWT_REFRESH_SECRET_KEY
+        generateValue: true
+      - key: RG_SETUP_BOOTSTRAP_TOKEN
+        generateValue: true
+      - key: RG_CONFIG_ENCRYPTION_KEY
+        generateValue: true
+      - key: RG_CORS_ORIGINS
+        value: ""
